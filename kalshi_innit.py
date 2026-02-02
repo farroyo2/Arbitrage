@@ -5,7 +5,7 @@ from cryptography.hazmat.primitives import serialization
 
 from clients import KalshiHttpClient, Environment
 
-def get_keys():
+def get_kalshi_keys():
     # Load environment variables
     load_dotenv()
     env = Environment.PROD # toggle environment here

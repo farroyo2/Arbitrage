@@ -56,7 +56,6 @@ class Kalshi_event_client:
                 print("DONE total events:", len(events))
                 packet = {
                     'type' : 'kalshi_events',
-                    'source' : 'kalshi',
                     'data' : events
                 }
                 await self.shared_queue.put(packet)

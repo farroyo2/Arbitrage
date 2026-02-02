@@ -240,7 +240,6 @@ class KalshiWebSocketClient(KalshiBaseClient):
             packet = {
                 'type' : "kalshi_prices",
                 'data' : {
-                    'source' : 'kalshi', 
                     'market_id' : msg['market_id'],
                     'yes_bid_doll' : msg['yes_bid_dollars'], 
                     'yes_ask_doll' : msg['yes_ask_dollars'],
