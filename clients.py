@@ -1,4 +1,4 @@
-import requests
+import httpx
 import base64
 import time
 from typing import Any, Dict, Optional
@@ -6,14 +6,13 @@ from datetime import datetime, timedelta
 from enum import Enum
 import json
 
-from requests.exceptions import HTTPError
-
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.exceptions import InvalidSignature
 
 import websockets
-import sqlite3
+from datetime import datetime, timezone
+import asyncio
 
 class Environment(Enum):
     DEMO = "demo"
@@ -96,64 +95,65 @@ class KalshiHttpClient(KalshiBaseClient):
         self.exchange_url = "/trade-api/v2/exchange"
         self.markets_url = "/trade-api/v2/markets"
         self.portfolio_url = "/trade-api/v2/portfolio"
+        self.client = httpx.AsyncClient()
 
-    def rate_limit(self) -> None:
+    async def rate_limit(self) -> None:
         """Built-in rate limiter to prevent exceeding API rate limits."""
         THRESHOLD_IN_MILLISECONDS = 100
         now = datetime.now()
         threshold_in_microseconds = 1000 * THRESHOLD_IN_MILLISECONDS
         threshold_in_seconds = THRESHOLD_IN_MILLISECONDS / 1000
         if now - self.last_api_call < timedelta(microseconds=threshold_in_microseconds):
-            time.sleep(threshold_in_seconds)
+            await asyncio.sleep(threshold_in_seconds)
         self.last_api_call = datetime.now()
 
-    def raise_if_bad_response(self, response: requests.Response) -> None:
+    async def raise_if_bad_response(self, response: httpx.Response) -> None:
         """Raises an HTTPError if the response status code indicates an error."""
         if response.status_code not in range(200, 299):
             response.raise_for_status()
 
-    def post(self, path: str, body: dict) -> Any:
+    async def post(self, path: str, body: dict) -> Any:
         """Performs an authenticated POST request to the Kalshi API."""
-        self.rate_limit()
-        response = requests.post(
+        await self.rate_limit()
+        response = await self.client.post(
             self.host + path,
             json=body,
             headers=self.request_headers("POST", path)
         )
-        self.raise_if_bad_response(response)
+        await self.raise_if_bad_response(response)
         return response.json()
 
-    def get(self, path: str, params: Dict[str, Any] = {}) -> Any:
+    async def get(self, path: str, params: Dict[str, Any] = {}) -> Any:
         """Performs an authenticated GET request to the Kalshi API."""
-        self.rate_limit()
-        response = requests.get(
+        await self.rate_limit()
+        response = await self.client.get(
             self.host + path,
             headers=self.request_headers("GET", path),
             params=params
         )
-        self.raise_if_bad_response(response)
+        await self.raise_if_bad_response(response)
         return response.json()
 
-    def delete(self, path: str, params: Dict[str, Any] = {}) -> Any:
+    async def delete(self, path: str, params: Dict[str, Any] = {}) -> Any:
         """Performs an authenticated DELETE request to the Kalshi API."""
-        self.rate_limit()
-        response = requests.delete(
+        await self.rate_limit()
+        response = await self.client.delete(
             self.host + path,
             headers=self.request_headers("DELETE", path),
             params=params
         )
-        self.raise_if_bad_response(response)
+        await self.raise_if_bad_response(response)
         return response.json()
 
-    def get_balance(self) -> Dict[str, Any]:
+    async def get_balance(self) -> Dict[str, Any]:
         """Retrieves the account balance."""
-        return self.get(self.portfolio_url + '/balance')
+        return await self.get(self.portfolio_url + '/balance')
 
-    def get_exchange_status(self) -> Dict[str, Any]:
+    async def get_exchange_status(self) -> Dict[str, Any]:
         """Retrieves the exchange status."""
-        return self.get(self.exchange_url + "/status")
+        return await self.get(self.exchange_url + "/status")
 
-    def get_trades(
+    async def get_trades(
         self,
         ticker: Optional[str] = None,
         limit: Optional[int] = None,
@@ -171,34 +171,36 @@ class KalshiHttpClient(KalshiBaseClient):
         }
         # Remove None values
         params = {k: v for k, v in params.items() if v is not None}
-        return self.get(self.markets_url + '/trades', params=params)
+        return await self.get(self.markets_url + '/trades', params=params)
 
 class KalshiWebSocketClient(KalshiBaseClient):
     """Client for handling WebSocket connections to the Kalshi API."""
     def __init__(
         self,
+        shared_queue: asyncio.Queue,
         key_id: str,
         private_key: rsa.RSAPrivateKey,
         environment: Environment = Environment.DEMO,
     ):
         super().__init__(key_id, private_key, environment)
+        self.shared_queue = shared_queue
         self.ws = None
         self.url_suffix = "/trade-api/ws/v2"
         self.message_id = 1  # Add counter for message IDs
 
-        self.db_path = "/Users/fernandoarroyo/Desktop/Fer&Tayden/Arbitrage/Kalshi.db"
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute("PRAGMA journal_mode = WAL;")
-
-    async def connect(self):
+    async def run(self):
         """Establishes a WebSocket connection using authentication."""
         host = self.WS_BASE_URL + self.url_suffix
-        auth_headers = self.request_headers("GET", self.url_suffix)
-        async with websockets.connect(host, additional_headers=auth_headers) as websocket:
-            self.ws = websocket
-            await self.on_open()
-            await self.handler()
+        while True:
+            try:
+                auth_headers = self.request_headers("GET", self.url_suffix)
+                async with websockets.connect(host, additional_headers=auth_headers) as websocket:
+                    self.ws = websocket
+                    await self.on_open()
+                    await self.handler()
+            except Exception as e:
+                print(f"Error with WebSocket: {str(e)}")
+                await asyncio.sleep(5)
 
     async def on_open(self):
         """Callback when WebSocket connection is opened."""
@@ -230,34 +232,30 @@ class KalshiWebSocketClient(KalshiBaseClient):
     async def on_message(self, message):
         """Callback for handling incoming messages."""
         try :
-            print("I made it to the BEGINNING")
             message = json.loads(message)
             msg = message['msg']
             
-            print("I made it to A")
-            print(msg['market_id'])
-            self.cursor.execute("""
-            INSERT OR IGNORE INTO markets (market_id, market_ticker)
-            VALUES (?, ?)
-            """, (msg['market_id'], msg['market_ticker']))
+            ts = datetime.fromtimestamp(msg['ts'], tz=timezone.utc)
 
-            print("I made it to B")
-            self.cursor.execute(
-                "INSERT INTO tickers (source, market_id, yes_bid_doll, yes_ask_doll, price_doll, ts, clock, volume, vol_doll, open_interest, open_interest_doll) VALUES ('Kalshi', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (msg['market_id'], msg['yes_bid_dollars'], msg['yes_ask_dollars'], msg['price_dollars'], msg['ts'], msg['Clock'], msg['volume'], msg['dollar_volume'], msg['open_interest'], msg['dollar_open_interest'])
-            )
+            packet = {
+                'type' : "kalshi_prices",
+                'data' : {
+                    'source' : 'kalshi', 
+                    'market_id' : msg['market_id'],
+                    'yes_bid_doll' : msg['yes_bid_dollars'], 
+                    'yes_ask_doll' : msg['yes_ask_dollars'],
+                    'price_doll' : msg['price_dollars'], 
+                    'volume' : msg['volume'], 
+                    'vol_doll' : msg['dollar_volume'], 
+                    'ts' : ts, 
+                    'open_interest' : msg['open_interest']
+                }
+            }
 
-            print("I made it to C")
-            self.cursor.execute("""
-            INSERT INTO latest_prices (source, market_id, yes_bid_doll, yes_ask_doll, price_doll, ts, clock, volume, vol_doll, open_interest, open_interest_doll)
-            VALUES ('Kalshi', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (source, market_id) DO UPDATE SET yes_bid_doll = excluded.yes_bid_doll, yes_ask_doll = excluded.yes_ask_doll, price_doll = excluded.price_doll, ts = excluded.ts, clock = excluded.clock, volume = excluded.volume, vol_doll = excluded.vol_doll, open_interest = excluded.open_interest, open_interest_doll = excluded.open_interest_doll""",
-            (msg['market_id'], msg['yes_bid_dollars'], msg['yes_ask_dollars'], msg['price_dollars'], msg['ts'], msg['Clock'], msg['volume'], msg['dollar_volume'], msg['open_interest'], msg['dollar_open_interest']))
-
-            self.conn.commit()
+            await self.shared_queue.put(packet)
         except Exception as e:
-            self.conn.rollback()
-            print("Error processing message:", e)
+            print("Will reconnect in 2s...")
+            await asyncio.sleep(2)
 
 
     async def on_error(self, error):
