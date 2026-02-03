@@ -114,9 +114,9 @@ class DatabaseWorker:
     
     async def insert_polymarket_prices(self, message, cursor):
         try:
-            ts = datetime.fromtimestamp(int(message["timestamp"])/1000).strftime("%Y-%m-%d %H:%M:%S")
+            ts = datetime.fromtimestamp(int(message["timestamp"])/1000, tz=timezone.utc)
         except:
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            ts = datetime.now(timezone.utc)
         changes = message.get("price_changes", [])
         for change in changes:
             await cursor.execute("""
@@ -135,6 +135,21 @@ class DatabaseWorker:
             """, (message["market"], change["best_bid"], change["best_ask"], change["price"], ts))
 
 
+    async def backfill_event_data(self, cursor):
+        query = """
+        UPDATE polymarket_events e
+        SET calc_exp_date = sub.max_date
+        FROM (
+        SELECT event_id, MAX(close_time) as max_date
+        FROM polymarket_markets
+        WHERE event_id IS NOT NULL
+        GROUP BY event_id
+        ) sub
+        WHERE e.event_id = sub.event_id
+        """
+
+        await cursor.execute(query)
+
     async def run(self):
         async with await psycopg.AsyncConnection.connect(self.uri) as conn:
             self.conn = conn
@@ -148,6 +163,7 @@ class DatabaseWorker:
                                 await self.insert_kalshi_events(data, cur)
                             case 'polymarket_events':
                                 await self.insert_polymarket_events(data, cur)
+                                await self.backfill_event_data(cur)
                             case 'kalshi_prices':
                                 await self.insert_kalshi_prices(data, cur)
                             case 'polymarket_prices':
