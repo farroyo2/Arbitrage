@@ -1,127 +1,54 @@
 # Arbitrage
 
-This project is an **arbitrage data engine**: it collects live market data from **two prediction markets** (Kalshi and Polymarket), stores it in a database, and is built so you can later **compare prices** and spot arbitrage opportunities (same outcome, different price on each site).
+This project is an **arbitrage data engine**: it collects live market data from **two prediction markets** (Kalshi and Polymarket), stores it in a PostgreSQL database, and is built so you can analyze, compare prices, and spot arbitrage opportunities (same outcome, different price on each site).
+
+Recently, the overarching architecture was expanded into distinct modules to support forecasting, cross-market automated matching via NLP, and news ingestion for sentiment analysis.
 
 ---
 
-## The Big Picture
+## 🏗️ Project Architecture
 
-```
-┌─────────────────┐     ┌─────────────────┐
-│     KALSHI      │     │   POLYMARKET     │
-│  (API + WS)     │     │  (API + WS)      │
-└────────┬────────┘     └────────┬────────┘
-         │                        │
-         │   events + prices      │   events + prices
-         ▼                        ▼
-    ┌─────────────────────────────────────┐
-    │         SHARED QUEUE (in-memory)     │
-    │   All data flows here as "packets"   │
-    └────────────────────┬────────────────┘
-                         │
-                         ▼
-    ┌─────────────────────────────────────┐
-    │     DATABASE WORKER / LIBRARIAN      │
-    │   Writes events & prices to Postgres │
-    └─────────────────────────────────────┘
-```
+### 1. `data_ingestion/` - The Core Engine
+This directory houses the primary asynchronous engine that powers the data collection.
+- **`main.py`**: The entry point. Creates a shared queue to process all data packets.
+- **`clients.py` / `db_worker.py`**: A database worker that listens to the shared queue and efficiently writes market events and live ticks to PostgreSQL using `psycopg`.
+- **Kalshi Subsystem (`kalshi_innit.py`, `kalshi_events_api.py`)**: Fetches upcoming events and price updates through Kalshi's REST and WebSocket interfaces.
+- **Polymarket Subsystem (`poly_innit.py`, `polymarket_events.py`, `polymarket_api.py`)**: Connects to Polymarket's Gamma API and WebSocket Orderbook.
+  
+**Data Flow**: Kalshi and Polymarket send events and prices into an in-memory shared queue. The database worker continuously persists everything to Postgres. I/O runs mostly via `asyncio`.
 
-- **Kalshi** and **Polymarket** are prediction markets (you bet on events like "Will X happen?").
----
+### 2. `cross_market_arb/` - Automated Market Matching
+Since Polymarket and Kalshi often name the same event differently, this module tries to automatically map and pair equivalent markets using NLP.
+- **`market_pairs.py`**: Uses a multi-stage pipeline algorithm to find identical active markets:
+  1. Time filtering (matches close times).
+  2. Keyword analysis (extracting heavily weighted keywords like "fed", "CPI", "trump").
+  3. Feature extraction (extracting and normalizing numbers from titles).
+  4. Fuzzy string matching (`rapidfuzz`).
+  5. **AI Cross-Encoder**: Final pipeline step routes potential matches through `cross-encoder/ms-marco-MiniLM-L-6-v2` (`sentence-transformers`) to compute semantic similarity. Identified pairs are inserted into the `market_pairs` Postgres table.
 
-## What Each Piece Does
+### 3. `News_ingestion/` - Real-Time Sentiment & Feeds
+Monitors live news feeds to help inform prediction market forecasts.
+- **`squaker_scraper.py`**: Connects to news APIs (like CryptoPanic) yielding up-to-the-minute updates and squawks.
+- **`finbert.ipynb` / `BT.py`**: Leverages FinBERT for running financial sentiment analysis against the ingested text data, labeling events as positive, negative, or neutral for market impact.
 
-### 1. **`main.py`** — The "engine"
-
-- Creates a **shared queue** (like a conveyor belt for data).
-- Starts several **tasks** that run at the same time (async):
-  - **Kalshi WebSocket** — live price updates from Kalshi.
-  - **Kalshi events** — list of events/markets from Kalshi (on a timer).
-  - **Polymarket WebSocket** — live order book / prices from Polymarket.
-  - **Polymarket events** — list of events/markets from Polymarket (on a timer).
-  - **Database worker** — reads from the queue and writes everything to the database.
-
-Everything runs together; when any component gets new data, it puts a **packet** (type + data) on the queue, and the DB worker stores it.
+### 4. `Market_Analyisis/` - Data Science & Modeling
+A standalone space for working with historical data, evaluating opportunities, and testing theories.
+- **`forecasting.ipynb`**: Modeling and forecasting on timeseries data for outcomes.
+- Contains various diagnostic notebooks (`markets_diag.ipynb`, `analysis.ipynb`) mapping out odds, trends, and market lifecycles.
 
 ---
 
-### 2. **Kalshi side**
+## 🚀 Setup & Requirements
 
-- **`clients.py`**
-  - **KalshiHttpClient** — one-off API calls (e.g. balance, trades).
-  - **KalshiWebSocketClient** — stays connected and gets **live ticker (price) updates**; each update is pushed to the shared queue as a `kalshi_prices` packet.
-- **`kalshi_innit.py`** — loads your Kalshi API key and private key from env / key file (for auth).
-- **`kalshi_events_api.py`**
-  - **Kalshi_event_client** — periodically fetches **all events (and their markets)** from Kalshi's API and puts them on the queue as `kalshi_events` packets.
-
-So: **events** = what you can trade; **prices** = live bid/ask from the WebSocket.
-
----
-
-### 3. **Polymarket side**
-
-- **`polymarket_events.py`**
-  - **PolyEvents** — periodically fetches **all (open) events** from Polymarket's Gamma API and puts them on the queue as `polymarket_events` packets.
-- **`polymarket_api.py`**
-  - **WebSocketOrderBook** — connects to Polymarket's WebSocket, gets **price / order book updates** (e.g. `price_change`), and can write them to Postgres (in the current code it uses a direct DB connection for that).
-- **`pmclient.py`** — Polymarket API client setup (credentials, etc.) for authenticated calls if needed.
-
-So again: **events** = list of markets; **WebSocket** = live prices/order book.
+1. **Python Dependencies:** Requires `httpx`, `websockets`, `cryptography`, `psycopg`, `rapidfuzz`, `sentence-transformers`, `torch`, `pandas`, `requests`, and standard data science libraries for the notebooks.
+2. **Environment Variables (.env)**:
+   - **Kalshi**: API Key + Private Key Path.
+   - **Polymarket**: Appropriate API Keys if trading/querying authenticated endpoints.
+   - **Postgres**: Connection string pointing to your local/remote database (e.g. `postgresql://user@localhost:5432/db`).
+3. **Database Setup**: Start Postgres and ensure the tables exist. You can usually bootstrap these using `create_tables.py` located in `data_ingestion/`.
+4. **Running the Engine**: Navigate to the `data_ingestion/` folder and execute `python main.py` to start syncing live events and prices.
 
 ---
 
-### 4. **Database**
-
-- **`db_worker.py`**
-  - **DatabaseWorker** — runs a loop: take a packet from the shared queue, then:
-    - `kalshi_events` → insert/update **Kalshi events and markets**.
-    - `polymarket_events` → insert/update **Polymarket events and markets**.
-    - `kalshi_prices` → insert **Kalshi price ticks** (and latest price).
-    - `polymarket_prices` → (placeholder for Polymarket price ticks).
-
-So the DB is the **single place** where both platforms' events and prices are stored, which is what you need to compare and find arbitrage.
-
----
-
-## Data Flow in One Sentence
-
-**Kalshi and Polymarket send events and prices into a shared queue; a database worker reads that queue and writes everything to Postgres so you can later compare prices across the two sites.**
-
----
-
-## What You Need to Run It
-
-- **Python** with the dependencies (e.g. `httpx`, `websockets`, `cryptography`, `psycopg`, etc.).
-- **Kalshi**: API key + private key (in `.env` / key file, see `kalshi_innit.py`).
-- **Polymarket**: API credentials if you use authenticated endpoints (see `pmclient.py`).
-- **PostgreSQL**: running locally (or wherever the connection strings point) with the expected tables (e.g. `kalshi_events`, `kalshi_markets`, `kalshi_tick_history`, `kalshi_latest_prices`, and the Polymarket equivalents).
-
----
-
-## Note About `main.py` and Module Names
-
-`main.py` imports:
-
-- `KalshiEvents` from `kalshi_events`
-- `DatabaseLibrarian` from `database_librarian`
-- `WebSocketOrderBook(shared_queue)` (only one argument)
-
-In the repo you have:
-
-- **Kalshi events**: class `Kalshi_event_client` in **`kalshi_events_api.py`** (no file named `kalshi_events.py`).
-- **DB worker**: class `DatabaseWorker` in **`db_worker.py`** (no file named `database_librarian.py`).
-- **Polymarket WebSocket**: `WebSocketOrderBook` in **`polymarket_api.py`** expects many arguments (channel type, url, data, auth, etc.), not just `shared_queue`.
-
-So to run the "engine" as in `main.py`, you'd need to either add thin modules that match those names (e.g. `kalshi_events.py` exporting `KalshiEvents` = `Kalshi_event_client`, `database_librarian.py` exporting `DatabaseLibrarian` = `DatabaseWorker`) and a small wrapper that builds `WebSocketOrderBook` with the right arguments and feeds a `shared_queue`, or change `main.py` to use the existing modules and class names directly. The **behavior** described above is how the repo is designed to work once those pieces are wired up.
-
----
-
-## Summary
-
-| Part            | Role |
-|-----------------|------|
-| **main.py**     | Starts the engine: queue + Kalshi/Polymarket data tasks + DB writer. |
-| **Kalshi**      | Events (what to trade) + live prices via WebSocket → queue. |
-| **Polymarket**  | Events (what to trade) + live prices via WebSocket → queue (and some direct DB writes in current code). |
-| **DB worker**   | Reads queue, writes events and prices to Postgres. |
-| **Goal**        | Centralized data so you can **compare Kalshi vs Polymarket prices** and find arbitrage opportunities. |
+## 📈 Goals
+With the latest additions, the project natively scales from pure **data streaming** to sophisticated **NLP-based market pairing** and **news-driven statistical forecasting**, laying out the perfect foundational pipeline for real-time risk-free prediction arbitrage.
